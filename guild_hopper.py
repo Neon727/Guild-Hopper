@@ -42,8 +42,10 @@ DEFAULT_STATE = {
     "joined_count": 0,
     "joined_guild_ids": [],
     "seen_invites": [],
-    "pending_invites": [],     # Live-captured from on_message
-    "deferred_invites": [],    # NEW: Found in history, but skipped
+    "pending_invites": [],
+    "deferred_invites": [],
+    "known_hubs": [],          # NEW: List of {"code": "...", "id": 123, "name": "..."}
+    "last_join_invite": None,  # NEW: The invite code used to enter the current server
     "current_guild_id": None,
 }
 
@@ -66,8 +68,8 @@ def save_state(state: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def scan_guild(client, guild):
-    """Walk readable channels in *guild* and return unseen invite codes."""
     candidates = []
+    invite_dates = set() # NEW: To track unique days
 
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
@@ -76,7 +78,11 @@ async def scan_guild(client, guild):
 
         try:
             async for msg in channel.history(limit=HISTORY_LIMIT):
-                for code in INVITE_RE.findall(msg.content or ""):
+                codes = INVITE_RE.findall(msg.content or "")
+                if codes:
+                    invite_dates.add(msg.created_at.date()) # Record the day
+                    
+                for code in codes:
                     if code in client.seen_invites:
                         continue
                     client.seen_invites.add(code)
@@ -88,7 +94,7 @@ async def scan_guild(client, guild):
         await asyncio.sleep(random.uniform(*CHANNEL_DELAY))
 
     client.persist()
-    return candidates
+    return candidates, len(invite_dates)
 
 async def resolve_invite(client, code):
     try:
@@ -129,18 +135,37 @@ async def try_join(client, code):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def join_from_hubs(client):
-    random.shuffle(FALLBACK_HUBS)
+    # 1. Combine learned hubs and static fallback hubs
+    all_hubs = list(client.state.get("known_hubs", []))
+    
+    # Add static hubs to the list if they aren't already there
     for raw in FALLBACK_HUBS:
         match = INVITE_RE.search(raw)
         code = match.group(1) if match else raw.strip().rstrip("/").split("/")[-1]
-        if not code or code in client.seen_invites:
+        if code and not any(h["code"] == code for h in all_hubs):
+            all_hubs.append({"code": code, "id": None, "name": "Static Fallback"})
+
+    random.shuffle(all_hubs)
+
+    for hub in all_hubs:
+        code = hub["code"]
+        if hub["id"] and hub["id"] in client.state["joined_guild_ids"]:
+            continue # Already visited this learned hub
+
+        invite = await resolve_invite(client, code)
+        if invite is None or invite.guild is None:
+            continue
+            
+        if invite.guild.id in client.state["joined_guild_ids"]:
             continue
 
-        print(f"  [hub] trying {code}")
+        print(f"  [hub] trying {code} ({hub.get('name')})")
         await asyncio.sleep(random.uniform(*HUB_DELAY))
         guild = await try_join(client, code)
-        if guild is not None and guild.id not in client.state["joined_guild_ids"]:
+        if guild is not None:
+            client.state["last_join_invite"] = code # Save the code used to join
             return guild
+
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,87 +189,84 @@ async def run_hopper(client):
         state["current_guild_id"] = current.id
         client.persist()
 
-        # ── 1. Gather Candidates from CURRENT server ──────────────────────
         candidates = []
-        
-        # Live-captured from on_message (prioritized)
         if client.pending_invites:
-            print(f"  [cache] {len(client.pending_invites)} pending invite(s)")
             candidates.extend(client.pending_invites)
             client.pending_invites.clear()
             client.persist()
 
-        # History scan of the current server
         print(f"\n=== Scanning: {current.name} ({current.id}) ===")
-        candidates.extend(await scan_guild(client, current))
+        history_candidates, days_spanned = await scan_guild(client, current)
+        candidates.extend(history_candidates)
+        
+        # ── HUB DETECTION LOGIC ──
+        # If we found >= 5 invites spread across >= 2 different days, it's a hub!
+        if len(history_candidates) >= 5 and days_spanned >= 2:
+            if state.get("last_join_invite"):
+                print(f"  [hub-detect] This server looks like a hub! ({len(history_candidates)} links over {days_spanned} days)")
+                # Check if we already saved it
+                if not any(h["id"] == current.id for h in state["known_hubs"]):
+                    state["known_hubs"].append({
+                        "code": state["last_join_invite"],
+                        "id": current.id,
+                        "name": current.name
+                    })
+                    client.persist()
+                    print(f"  [hub-detect] Saved to known_hubs.")
+
         print(f"  {len(candidates)} total candidate(s) found in this server")
 
-        # ── 2. Try to join from the current server ────────────────────────
         joined = None
-        
         for i, code in enumerate(candidates):
             invite = await resolve_invite(client, code)
-            if invite is None or invite.guild is None:
-                continue
-            if invite.guild.id == current.id:
-                continue
-            if invite.guild.id in state["joined_guild_ids"]:
-                continue
+            if invite is None or invite.guild is None: continue
+            if invite.guild.id == current.id: continue
+            if invite.guild.id in state["joined_guild_ids"]: continue
 
-            # Respect the 100-guild cap
             if len(client.guilds) >= 100:
                 print("  [cap] at 100 guilds — leaving current guild first")
-                try:
-                    await current.leave()
-                except discord.HTTPException as exc:
-                    print(f"  [leave] failed: {exc}")
+                try: await current.leave()
+                except: pass
                 current = None
 
             await asyncio.sleep(random.uniform(*JOIN_DELAY))
             try:
                 joined = await try_join(client, code)
             except RuntimeError as exc:
-                if str(exc) == "captcha":
-                    print("  [stop] CAPTCHA required. Halting join loop.")
-                    return
+                if str(exc) == "captcha": return
                 raise
 
             if joined is not None:
-                # SUCCESS! Save all remaining untried links to the backlog
+                state["last_join_invite"] = code # Save the invite for hub learning
                 leftover = candidates[i+1:]
                 if leftover:
                     print(f"  [defer] saving {len(leftover)} untried invite(s) to backlog")
                     client.deferred_invites.extend(leftover)
                     client.persist()
-                break # Break out of the candidates loop
+                break
 
-        # ── 3. Fallbacks (Only if the current server was a dead end) ──────
         if joined is None:
             print("  no usable invites in this server.")
-            
-            # Fallback A: Check the deferred backlog
             if client.deferred_invites:
                 print(f"  [backlog] checking {len(client.deferred_invites)} deferred invite(s)")
                 while client.deferred_invites and joined is None:
                     code = client.deferred_invites.pop(0)
-                    client.persist() # Save immediately in case it crashes mid-join
+                    client.persist()
                     
                     invite = await resolve_invite(client, code)
-                    if invite is None or invite.guild is None:
-                        continue
-                    if invite.guild.id in state["joined_guild_ids"]:
-                        continue
+                    if invite is None or invite.guild is None: continue
+                    if invite.guild.id in state["joined_guild_ids"]: continue
 
                     await asyncio.sleep(random.uniform(*JOIN_DELAY))
                     try:
                         joined = await try_join(client, code)
                     except RuntimeError as exc:
-                        if str(exc) == "captcha":
-                            print("  [stop] CAPTCHA required. Halting join loop.")
-                            return
+                        if str(exc) == "captcha": return
                         raise
-            
-            # Fallback B: Hubs
+                        
+                    if joined is not None:
+                        state["last_join_invite"] = code
+
             if joined is None:
                 print("  backlog empty/failed — falling back to hubs")
                 joined = await join_from_hubs(client)
@@ -254,7 +276,6 @@ async def run_hopper(client):
             await asyncio.sleep(300)
             continue
 
-        # ── 4. Bookkeeping & Leave Old Server ─────────────────────────────
         state["joined_count"] += 1
         if joined.id not in state["joined_guild_ids"]:
             state["joined_guild_ids"].append(joined.id)
@@ -262,14 +283,13 @@ async def run_hopper(client):
         client.persist()
         print(f"  [✓] joined #{state['joined_count']}: {joined.name} ({joined.id})")
 
-        await asyncio.sleep(5) # Let cache populate
+        await asyncio.sleep(5)
 
         if current is not None and current.id != joined.id:
             try:
                 await current.leave()
                 print(f"  [leave] left {current.name}")
-            except discord.HTTPException as exc:
-                print(f"  [leave] failed: {exc}")
+            except: pass
 
         current = joined
 
