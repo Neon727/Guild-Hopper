@@ -62,6 +62,28 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def generate_permanent_invite(client, guild):
+    """Tries to create an infinite, permanent invite for the server."""
+    for channel in guild.text_channels:
+        # We need Create Invite permission
+        perms = channel.permissions_for(guild.me)
+        if not perms.create_instant_invite:
+            continue
+            
+        try:
+            # max_age=0 means never expires. max_uses=0 means infinite uses.
+            invite = await channel.create_invite(max_age=0, max_uses=0, unique=False, reason="Hub hopper backup")
+            return invite.code
+        except discord.Forbidden:
+            continue
+        except discord.HTTPException as exc:
+            print(f"  [invite] failed to create in #{channel.name}: {exc}")
+            
+    return None # Couldn't create one
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Invite discovery
@@ -201,18 +223,25 @@ async def run_hopper(client):
         
         # ── HUB DETECTION LOGIC ──
         # If we found >= 5 invites spread across >= 2 different days, it's a hub!
+                # ── HUB DETECTION LOGIC ──
         if len(history_candidates) >= 5 and days_spanned >= 2:
-            if state.get("last_join_invite"):
-                print(f"  [hub-detect] This server looks like a hub! ({len(history_candidates)} links over {days_spanned} days)")
-                # Check if we already saved it
-                if not any(h["id"] == current.id for h in state["known_hubs"]):
+            if not any(h["id"] == current.id for h in state["known_hubs"]):
+                print(f"  [hub-detect] This server is a hub! Generating a permanent invite...")
+                
+                # Try to generate a permanent link
+                permanent_code = await generate_permanent_invite(client, current)
+                
+                # Fall back to the link we used if we don't have permissions to make one
+                code_to_save = permanent_code if permanent_code else state.get("last_join_invite")
+                
+                if code_to_save:
                     state["known_hubs"].append({
-                        "code": state["last_join_invite"],
+                        "code": code_to_save,
                         "id": current.id,
                         "name": current.name
                     })
                     client.persist()
-                    print(f"  [hub-detect] Saved to known_hubs.")
+                    print(f"  [hub-detect] Saved hub with code: {code_to_save}")
 
         print(f"  {len(candidates)} total candidate(s) found in this server")
 
