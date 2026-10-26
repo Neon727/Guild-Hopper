@@ -42,7 +42,8 @@ DEFAULT_STATE = {
     "joined_count": 0,
     "joined_guild_ids": [],
     "seen_invites": [],
-    "pending_invites": [],
+    "pending_invites": [],     # Live-captured from on_message
+    "deferred_invites": [],    # NEW: Found in history, but skipped
     "current_guild_id": None,
 }
 
@@ -163,21 +164,25 @@ async def run_hopper(client):
         state["current_guild_id"] = current.id
         client.persist()
 
-        # 1) Drain live-captured invites first (these may be from deleted msgs)
+        # ── 1. Gather Candidates from CURRENT server ──────────────────────
         candidates = []
+        
+        # Live-captured from on_message (prioritized)
         if client.pending_invites:
             print(f"  [cache] {len(client.pending_invites)} pending invite(s)")
             candidates.extend(client.pending_invites)
             client.pending_invites.clear()
             client.persist()
 
-        # 2) Then scan history
+        # History scan of the current server
         print(f"\n=== Scanning: {current.name} ({current.id}) ===")
         candidates.extend(await scan_guild(client, current))
-        print(f"  {len(candidates)} candidate(s)")
+        print(f"  {len(candidates)} total candidate(s) found in this server")
 
+        # ── 2. Try to join from the current server ────────────────────────
         joined = None
-        for code in candidates:
+        
+        for i, code in enumerate(candidates):
             invite = await resolve_invite(client, code)
             if invite is None or invite.guild is None:
                 continue
@@ -186,7 +191,7 @@ async def run_hopper(client):
             if invite.guild.id in state["joined_guild_ids"]:
                 continue
 
-            # Respect the 100-guild cap: leave first if at limit.
+            # Respect the 100-guild cap
             if len(client.guilds) >= 100:
                 print("  [cap] at 100 guilds — leaving current guild first")
                 try:
@@ -205,19 +210,51 @@ async def run_hopper(client):
                 raise
 
             if joined is not None:
-                break
+                # SUCCESS! Save all remaining untried links to the backlog
+                leftover = candidates[i+1:]
+                if leftover:
+                    print(f"  [defer] saving {len(leftover)} untried invite(s) to backlog")
+                    client.deferred_invites.extend(leftover)
+                    client.persist()
+                break # Break out of the candidates loop
 
-        # 3) Nothing usable here — try hubs
+        # ── 3. Fallbacks (Only if the current server was a dead end) ──────
         if joined is None:
-            print("  no usable invites — falling back to hubs")
-            joined = await join_from_hubs(client)
+            print("  no usable invites in this server.")
+            
+            # Fallback A: Check the deferred backlog
+            if client.deferred_invites:
+                print(f"  [backlog] checking {len(client.deferred_invites)} deferred invite(s)")
+                while client.deferred_invites and joined is None:
+                    code = client.deferred_invites.pop(0)
+                    client.persist() # Save immediately in case it crashes mid-join
+                    
+                    invite = await resolve_invite(client, code)
+                    if invite is None or invite.guild is None:
+                        continue
+                    if invite.guild.id in state["joined_guild_ids"]:
+                        continue
+
+                    await asyncio.sleep(random.uniform(*JOIN_DELAY))
+                    try:
+                        joined = await try_join(client, code)
+                    except RuntimeError as exc:
+                        if str(exc) == "captcha":
+                            print("  [stop] CAPTCHA required. Halting join loop.")
+                            return
+                        raise
+            
+            # Fallback B: Hubs
+            if joined is None:
+                print("  backlog empty/failed — falling back to hubs")
+                joined = await join_from_hubs(client)
 
         if joined is None:
             print("  hubs exhausted — idling 5 minutes")
             await asyncio.sleep(300)
             continue
 
-        # ── success bookkeeping ────────────────────────────────────────────
+        # ── 4. Bookkeeping & Leave Old Server ─────────────────────────────
         state["joined_count"] += 1
         if joined.id not in state["joined_guild_ids"]:
             state["joined_guild_ids"].append(joined.id)
@@ -225,7 +262,7 @@ async def run_hopper(client):
         client.persist()
         print(f"  [✓] joined #{state['joined_count']}: {joined.name} ({joined.id})")
 
-        await asyncio.sleep(5)  # let channel cache populate
+        await asyncio.sleep(5) # Let cache populate
 
         if current is not None and current.id != joined.id:
             try:
@@ -245,8 +282,10 @@ class HopperClient(discord.Client):
         self.state = load_state()
         self.seen_invites = set(self.state["seen_invites"])
         self.pending_invites = list(self.state.get("pending_invites", []))
+        self.deferred_invites = list(self.state.get("deferred_invites", [])) # NEW
         print(f"Logged in as {self.user} ({self.user.id})")
         print(f"Joined count so far: {self.state['joined_count']}")
+        print(f"Backlog: {len(self.deferred_invites)} deferred, {len(self.pending_invites)} pending")
         try:
             await run_hopper(self)
         except KeyboardInterrupt:
@@ -257,6 +296,7 @@ class HopperClient(discord.Client):
     def persist(self):
         self.state["seen_invites"] = list(self.seen_invites)
         self.state["pending_invites"] = list(self.pending_invites)
+        self.state["deferred_invites"] = list(self.deferred_invites) # NEW
         save_state(self.state)
 
     async def on_message(self, message):
