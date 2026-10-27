@@ -28,7 +28,7 @@ JOIN_DELAY    = (30, 90)     # bumped from 20-60 to reduce flag risk
 HUB_DELAY     = (30, 90)
 
 PENDING_CAP = 200            # max live-captured invites held in memory
-
+MAX_SERVERS_TO_KEEP = 50   # Stay in this many servers before leaving the oldest
 FALLBACK_HUBS = [
     # "discord.gg/exampleHub1",
     # "discord.gg/exampleHub2",
@@ -41,11 +41,12 @@ FALLBACK_HUBS = [
 DEFAULT_STATE = {
     "joined_count": 0,
     "joined_guild_ids": [],
+    "join_queue": [],          # NEW: Tracks the order of joined servers
     "seen_invites": [],
     "pending_invites": [],
     "deferred_invites": [],
-    "known_hubs": [],          # NEW: List of {"code": "...", "id": 123, "name": "..."}
-    "last_join_invite": None,  # NEW: The invite code used to enter the current server
+    "known_hubs": [],
+    "last_join_invite": None,
     "current_guild_id": None,
 }
 
@@ -305,21 +306,48 @@ async def run_hopper(client):
             await asyncio.sleep(300)
             continue
 
+                # ── 4. Bookkeeping & Queue Management ─────────────────────────────
         state["joined_count"] += 1
         if joined.id not in state["joined_guild_ids"]:
             state["joined_guild_ids"].append(joined.id)
+            
+        # Add the new server to the end of the queue
+        if joined.id not in state["join_queue"]:
+            state["join_queue"].append(joined.id)
+            
         state["current_guild_id"] = joined.id
         client.persist()
         print(f"  [✓] joined #{state['joined_count']}: {joined.name} ({joined.id})")
+        print(f"  [queue] Currently in {len(client.guilds)} / {MAX_SERVERS_TO_KEEP} kept servers")
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(5) # Let channel cache populate
 
-        if current is not None and current.id != joined.id:
-            try:
-                await current.leave()
-                print(f"  [leave] left {current.name}")
-            except: pass
+        # ── 5. Cleanup: Leave the oldest server if we are over the limit ──
+        # We check > MAX_SERVERS_TO_KEEP to ensure we leave BEFORE hitting the hard 100 cap
+        while len(client.guilds) > MAX_SERVERS_TO_KEEP and len(state["join_queue"]) > 1:
+            oldest_id = state["join_queue"].pop(0) # Pop from the front (oldest)
+            
+            # Never leave the server we are currently scanning
+            if oldest_id == joined.id:
+                state["join_queue"].append(oldest_id)
+                break
+                
+            old_guild = client.get_guild(oldest_id)
+            if old_guild:
+                # Don't leave if we own the server
+                if old_guild.owner_id == client.user.id:
+                    print(f"  [leave] cannot leave {old_guild.name} (we own it)")
+                    continue # Drop it from the queue, don't try to leave again
+                
+                try:
+                    await old_guild.leave()
+                    print(f"  [leave] left oldest server: {old_guild.name}")
+                except discord.HTTPException as exc:
+                    print(f"  [leave] failed to leave {old_guild.name}: {exc}")
+            
+            client.persist()
 
+        # Set the new server as the current one to scan next loop
         current = joined
 
 # ─────────────────────────────────────────────────────────────────────────────
