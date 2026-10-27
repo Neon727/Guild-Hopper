@@ -1,9 +1,9 @@
 # Guild Hopper
 
 A self-bot that scans the servers you're in for Discord invite links, joins the
-servers those links point to, leaves the old server, and repeats. It keeps a
-running count of how many servers it has successfully joined and survives
-restarts via a JSON state file.
+servers those links point to, and repeats. It keeps a running count of how many
+servers it has successfully joined, maintains a safe buffer of servers, and
+survives restarts via a JSON state file.
 
 > **Read the disclaimer before you run this.** It is not a toy.
 
@@ -51,34 +51,37 @@ lost, or data exposed as a result of running this script.
 
 ---
 
-## What it actually does
+## How it works (The 5 Stages)
 
-The loop has four stages:
-
-1. **Scan** — walk every text channel in the current server where the account
+1. **Scan** — Walk every text channel in the current server where the account
    has `View Channel` and `Read Message History`, pull the last
    `HISTORY_LIMIT` messages from each, and regex out any
    `discord.gg/<code>` or `discord.com/invite/<code>` links.
-2. **Capture live** — while scanning runs, an `on_message` listener also grabs
+2. **Capture live** — While scanning runs, an `on_message` listener also grabs
    invite codes the instant they're posted, before anyone can delete them.
-   These are queued separately and drained first on the next loop.
-3. **Join** — for each candidate, fetch the invite, validate it (not expired,
-   not the current server, not a server already visited), wait a randomized
-   delay, then accept it.
-4. **Leave & repeat** — after the join succeeds, leave the previous server and
-   make the new one current. Increment `joined_count`. Loop.
+   These are queued separately and checked first.
+3. **Join** — For each candidate, fetch the invite, validate it, wait a
+   randomized delay, then accept it. 
+4. **Defer** — If a server has multiple links, the bot only joins the first one.
+   It saves all the leftover links to a **Deferred Backlog** so it can use them
+   later if it lands in a dead-end server.
+5. **Safe Queue** — Instead of instantly leaving servers (which flags the
+   account), the bot stays in them. Once it hits `MAX_SERVERS_TO_KEEP`, it
+   leaves the *oldest* server to make room for the new one.
 
-If a server yields no usable invites, the script falls back to a list of
-permanent "hub" invites you supply. If the hubs are also exhausted, it idles
-for 5 minutes and retries the current server.
+### Hub Detection & Learning
+If a server yields a massive amount of invites (e.g., 5+ invites spanning
+multiple days), the bot flags it as a "Hub". It then tries to **generate its own
+permanent, infinite-use invite** to that server. It saves this invite to a
+`known_hubs` list. If the bot ever runs out of links, it uses these
+self-generated hub invites to safely teleport back to a known active server.
 
 ### What it does *not* do
 
 - It does not solve CAPTCHAs. It halts when one appears.
 - It does not read DMs or channels the account can't already see.
 - It does not scrape users, messages, or any data beyond invite codes.
-- It does not bypass the 100-guild cap — it leaves the current server before
-  joining when at the limit.
+- It does not bypass the 100-guild hard cap.
 
 ---
 
@@ -87,10 +90,10 @@ for 5 minutes and retries the current server.
 | File | Purpose |
 |---|---|
 | `guild_hopper.py` | The script. |
-| `hopper_state.json` | Created on first run. Stores `joined_count`, the list of guild IDs already visited, the set of invite codes already seen, and any pending live-captured invites. Delete this to reset. |
+| `hopper_state.json` | Created on first run. Stores `joined_count`, `join_queue`, `seen_invites`, `deferred_invites`, `known_hubs`, and more. Delete this to reset completely. |
 
 `hopper_state.json` is human-readable and safe to edit by hand if you want to
-clear a specific guild or invite from the "seen" lists.
+clear a specific guild or invite from the lists.
 
 ---
 
@@ -130,26 +133,24 @@ python -m pip install -U discord.py-self
 
 ### 2. Provide your token
 
-Either edit the `TOKEN =` line near the top of the script, or set an
-environment variable. **The environment variable is safer** — a hardcoded
-token can leak into backups, screenshots, and chat history.
+Edit the `TOKEN =` line near the top of the script. 
 
-```bash
-# macOS / Linux
-export DISCORD_TOKEN="your_token_here"
+> **Security Note:** A hardcoded token can leak into backups and screenshots.
+> The safest method is to use an environment variable:
+> 
+> ```bash
+> # macOS / Linux
+> export DISCORD_TOKEN="your_token_here"
+> 
+> # Windows PowerShell
+> $env:DISCORD_TOKEN = "your_token_here"
+> ```
 
-# Windows PowerShell (current session only)
-$env:DISCORD_TOKEN = "your_token_here"
-```
-
-> On Windows, `setx` only affects *new* terminals. If you set the variable
-> with `setx`, close and reopen your terminal, or the script will keep reading
-> the old (or empty) value.
-
-### 3. Add hub fallbacks
+### 3. Add starter hubs
 
 Open `guild_hopper.py` and fill in `FALLBACK_HUBS` with **permanent, never-expiring**
-invites to large public servers that regularly contain invite links:
+invites to large public servers. The bot will learn its own hubs over time, but
+you need at least one safe starting point in case it lands in an empty server.
 
 ```python
 FALLBACK_HUBS = [
@@ -158,16 +159,7 @@ FALLBACK_HUBS = [
 ]
 ```
 
-If you skip this step, the script will idle forever when it lands in a server
-that has no invites in its history.
-
-### 4. Make sure you're already in at least one server
-
-The script picks a starting server from `hopper_state.json` if one is saved,
-otherwise from `client.guilds` (whichever the library returns first). If you're
-in zero servers, it exits immediately.
-
-### 5. Run it
+### 4. Run it
 
 ```bash
 python guild_hopper.py
@@ -183,62 +175,46 @@ All the tunable values are at the top of the file.
 |---|---|---|
 | `HISTORY_LIMIT` | `500` | Messages to read per channel. Higher = more invites found, more API calls, longer scans. |
 | `CHANNEL_DELAY` | `(1.5, 4.0)` | Random seconds between channels while scanning. |
-| `JOIN_DELAY` | `(30, 90)` | Random seconds before each join attempt. **This is your main lever against being flagged.** Lower = faster ban. |
+| `JOIN_DELAY` | `(30, 90)` | Random seconds before each join attempt. **Lower = faster ban.** |
 | `HUB_DELAY` | `(30, 90)` | Random seconds before each hub-fallback join. |
-| `PENDING_CAP` | `200` | Maximum live-captured invites held in memory. Prevents runaway growth in very active servers. |
+| `PENDING_CAP` | `200` | Max live-captured invites held in memory. |
+| `MAX_SERVERS_TO_KEEP` | `50` | How many servers to stay in before leaving the oldest one. |
 | `FALLBACK_HUBS` | `[]` | Permanent invites tried when the current server yields nothing usable. |
 
-`HISTORY_LIMIT` counts per channel. On a 200-channel server with limit 500,
-expect a lot of paginated requests. The library will sleep internally on rate
-limits.
+### Why `MAX_SERVERS_TO_KEEP` matters
 
-`JOIN_DELAY` is set fairly conservatively by default. You can lower it, but
-every second you shave off increases the chance that the next action is a
-forced re-verification (which kills your token) rather than a successful join.
-
----
-
-## Architecture & Design Notes
-
-A few deliberate choices were made to prevent the bot from crashing or getting instantly banned:
-
-- **`JOIN_DELAY` is not a performance knob.** It exists specifically to mimic human pacing. Lowering it to 1-2 seconds is the fastest way to trigger a CAPTCHA or get the token revoked.
-- **The 100-Guild Cap is handled via "Leave-First".** If the bot is in 100 servers, it leaves the current one *before* trying to join the new one. If the join then fails, you end up guildless until the hub fallback saves you.
-- **The CAPTCHA path halts the loop.** If Discord returns a `400` with code `-1`, the script stops. It does not spam retries. Retrying through a CAPTCHA is what escalates a soft flag to a permanent ban.
-- **State is shared on the Client.** Because `on_message` (live capture) and `scan_guild` (history scanning) both write to `seen_invites`, they share the same in-memory state (`client.state`, `client.seen_invites`). This prevents race conditions where one overwrites the other.
-- **Deleted messages are cached.** `on_message` grabs invite codes the millisecond they are posted and saves them to `pending_invites`. If a user deletes their message immediately after posting, the bot still has the code.
-- **State is saved synchronously.** `client.persist()` writes to disk immediately after any state change. If the script crashes or the token dies, you don't lose your progress or your cached invites.
+If a bot joins 50 servers and immediately leaves them, Discord's anti-spam
+systems will flag the account within minutes. By keeping the bot in 50 servers,
+it mimics a normal user who just hoards servers. When it joins the 51st server,
+it quietly leaves the very first one it ever joined.
 
 ---
 
 ## Reading the output
 
 ```
-Logged in as yourname (1234567890)
-Joined count so far: 0
-
 === Scanning: Some Server (1111111111) ===
   [cache] captured abc123 from #general
-  [cache] captured xyz789 from #advertise
-  [cache] 2 pending invite(s)
-  5 candidate(s)
+  [hub-detect] This server looks like a hub! Generating a permanent invite...
+  [hub-detect] Saved hub with code: xyz789
+  5 candidate(s) found in this server
+  [defer] saving 4 untried invite(s) to backlog
   [✓] joined #1: Another Server (2222222222)
-  [leave] left Some Server
+  [queue] Currently in 1 / 50 kept servers
 ```
 
 Key lines:
 
-- `[cache] captured <code>` — an invite was seen in a live message and queued
+- `[cache] captured <code>` — An invite was seen in a live message and queued
   before anyone could delete it.
-- `[history] #channel: ...` — a channel's history couldn't be read (usually
-  permissions changed since you joined).
-- `[cap] at 100 guilds` — the script is at the guild limit and will leave the
-  current server before attempting the join.
-- `[hub] trying <code>` — the hub fallback is being used.
-- `[join] CAPTCHA challenge detected` — the script **stops**. This is not a bug;
-  it's the script refusing to hammer Discord after being told to prove it's
-  human. To continue you'd have to solve the CAPTCHA manually, which defeats
-  the purpose.
+- `[hub-detect]` — The bot realized this is a high-traffic server and generated
+  its own permanent invite to save as an emergency fallback.
+- `[defer]` — The bot found multiple links but only used one. The rest are saved
+  for later.
+- `[queue]` — Shows how many servers the bot is currently sitting in.
+- `[leave] left oldest server` — Triggers when the bot hits 51 servers.
+- `[join] CAPTCHA challenge detected` — The script **stops**. This is not a bug;
+  it's refusing to hammer Discord after being told to prove it's human.
 
 ---
 
@@ -246,38 +222,18 @@ Key lines:
 
 ### `LoginFailure: Improper token has been passed` / `401 Unauthorized`
 
-The token is dead or not being read. Check in this order:
-
-1. **Is it a user token or a bot token?** Bot tokens come from the Developer
-   Portal and will not work. User tokens come from the Discord *client* —
-   DevTools → Network → `authorization` header, or Application →
-   Local Storage → `token`.
+1. **Is it a user token or a bot token?** Bot tokens will not work. User tokens
+   come from DevTools → Network → `authorization`.
 2. **Did you re-verify your email recently?** Re-verification invalidates every
-   existing token. Re-extract from a fresh, logged-in browser session.
-3. **Are there hidden characters?** Check with:
-   ```python
-   print(repr(token))
-   ```
-   Look for `\n`, leading spaces, or zero-width characters. `client.run()`
-   strips whitespace but not zero-width characters.
-4. **Are both `discord.py` and `discord.py-self` installed?** See the
+   existing token. Re-extract from a fresh browser session.
+3. **Are both `discord.py` and `discord.py-self` installed?** See the
    "Requirements" section above.
-5. **Is your terminal reading the value you think it is?**
-   ```powershell
-   echo $env:DISCORD_TOKEN
-   ```
-
-### `NameError: name 'main' is not defined`
-
-The `def main():` block is missing from the bottom of the file. Re-paste the
-entrypoint section.
 
 ### `TypeError: scan_guild() takes 2 positional arguments but 3 were given`
 
-The function signature and the call site are out of sync. Either revert
-`scan_guild` to 3 arguments, or fully apply the caching patch (which changes
-both the signature and the call site). Mixing half the patch in is the usual
-cause.
+The function signature and the call site are out of sync. Ensure you are using
+the latest version of the script where `scan_guild(client, guild)` expects only
+two arguments.
 
 ### `AttributeError: 'Invite' object has no attribute 'accept'`
 
@@ -294,16 +250,6 @@ with:
 await client.accept_invite(code)
 ```
 
-### The script joins a few servers, then gets stuck
-
-Likely causes:
-
-- It hit the guild cap and every leave-first attempt is failing.
-- Every candidate it finds is expired or already visited — check
-  `seen_invites` and `joined_guild_ids` in `hopper_state.json`.
-- It's being rate-limited hard. The library sleeps on 429 responses, but if the
-  console goes quiet for several minutes at a time that's what's happening.
-
 ### The console is silent for a long time
 
 Normal during history scans on large servers, and normal during `JOIN_DELAY`
@@ -314,9 +260,9 @@ and check the log — the library usually prints rate-limit notices.
 
 ## Resetting
 
-Delete `hopper_state.json` to reset `joined_count`, clear the visited-guild
-list, and re-scan every server from scratch. The next run starts from whichever
-guild the library returns first.
+Delete `hopper_state.json` to reset `joined_count`, clear the queue, wipe the
+learned hubs, and re-scan every server from scratch. The next run starts from
+whichever guild the library returns first.
 
 ---
 
@@ -327,11 +273,6 @@ guild the library returns first.
   invalidate it.
 - Reading `Read Message History` in a server is not the same as *permission* to
   scrape it for invite links. Server owners can and do ban accounts for it.
-- The "100 guilds" cap is a hard limit on free accounts. The script respects
-  it by leaving before joining — but if the join then fails, you're guildless
-  until the hub fallback (or a manual join) gets you somewhere new.
-
-If you want the invite-discovery half without the join automation, the
-`scan_guild` + `on_message` logic works as a standalone harvester — it writes
-invite codes to a queue, and you join manually. That removes the highest-risk
-part of the loop. It's the version that doesn't keep killing your token.
+- The bot generates its own invites to servers it deems "Hubs". If you do not
+  want the bot creating invites on your behalf, remove the
+  `generate_permanent_invite` function.
